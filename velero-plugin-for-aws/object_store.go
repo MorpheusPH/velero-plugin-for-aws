@@ -402,15 +402,28 @@ func (o *ObjectStore) ListCommonPrefixes(bucket, prefix, delimiter string) ([]st
 }
 
 func (o *ObjectStore) ListObjects(bucket, prefix string) ([]string, error) {
+	log := o.log.WithFields(
+		logrus.Fields{
+			"bucket":    bucket,
+			"prefix":    prefix,
+		},
+	)
 	req := &s3.ListObjectsV2Input{
 		Bucket: &bucket,
 		Prefix: &prefix,
 	}
 
+	tryListV1 := false
 	var ret []string
 	err := o.s3.ListObjectsV2Pages(req, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 		for _, obj := range page.Contents {
 			ret = append(ret, *obj.Key)
+		}
+		if *page.IsTruncated && page.NextContinuationToken == nil {
+			tryListV1 = true
+			// we force a return as soon as invalid API found
+			log.Debugf("the page is truncated but nextContinuationToken is not present, trying ListObjects API")
+			return false
 		}
 		return !lastPage
 	})
@@ -419,6 +432,24 @@ func (o *ObjectStore) ListObjects(bucket, prefix string) ([]string, error) {
 		return nil, errors.WithStack(err)
 	}
 
+	if tryListV1 {
+		// lets try the above all over again for ListV1
+		log.Info("listing prefixes with ListObjects API")
+		reqV1 := &s3.ListObjectsInput{
+			Bucket:    &bucket,
+			Prefix:    &prefix,
+		}
+		ret = []string{}
+		err := o.s3.ListObjectsPages(reqV1, func(page *s3.ListObjectsOutput, lastPage bool) bool {
+			for _, obj := range page.Contents {
+				ret = append(ret, *obj.Key)
+			}
+			return !lastPage
+		})
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+	}
 	// ensure that returned objects are in a consistent order so that the deletion logic deletes the objects before
 	// the pseudo-folder prefix object for s3 providers (such as Quobyte) that return the pseudo-folder as an object.
 	// See https://github.com/vmware-tanzu/velero/pull/999
